@@ -14,6 +14,6 @@ class AccountMove(models.Model):
             )
             if payment_mode.bank_account_link == "fixed":
                 vals_list[
-                    "invoice_partner_bank_id"
+                    "partner_bank_id"
                 ] = payment_mode.fixed_journal_id.bank_account_id.id
         return super().create(vals_list)
