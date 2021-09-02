@@ -1,9 +1,9 @@
 # Copyright 2014-16 Akretion - Alexis de Lattre <alexis.delattre@akretion.com>
 # Copyright 2014 Serv. Tecnol. Avanzados - Pedro M. Baeza
+# Copyright 2021 Tecnativa - Víctor Martínez
 # License AGPL-3.0 or later (http://www.gnu.org/licenses/agpl.html).
 
-from odoo import _, api, fields, models
-from odoo.exceptions import ValidationError
+from odoo import api, fields, models
 
 
 class AccountMove(models.Model):
@@ -21,6 +21,7 @@ class AccountMove(models.Model):
         store=True,
         ondelete="restrict",
         readonly=False,
+        check_company=True,
     )
     bank_account_required = fields.Boolean(
         related="payment_mode_id.payment_method_id.bank_account_required", readonly=True
@@ -57,14 +58,36 @@ class AccountMove(models.Model):
         for move in self:
             move.payment_mode_id = False
             if move.partner_id:
+                partner = move.with_company(move.company_id.id).partner_id
                 if move.move_type == "in_invoice":
-                    move.payment_mode_id = move.with_company(
-                        move.company_id.id
-                    ).partner_id.supplier_payment_mode_id
+                    move.payment_mode_id = partner.supplier_payment_mode_id
                 elif move.move_type == "out_invoice":
-                    move.payment_mode_id = move.with_company(
-                        move.company_id.id
-                    ).partner_id.customer_payment_mode_id
+                    move.payment_mode_id = partner.customer_payment_mode_id
+                elif (
+                    move.move_type in ["out_refund", "in_refund"]
+                    and move.reversed_entry_id
+                ):
+                    move.payment_mode_id = (
+                        move.reversed_entry_id.payment_mode_id.refund_payment_mode_id
+                    )
+                elif not move.reversed_entry_id:
+                    if move.move_type == "out_refund":
+                        move.payment_mode_id = (
+                            partner.customer_payment_mode_id.refund_payment_mode_id
+                        )
+                    elif move.move_type == "in_refund":
+                        move.payment_mode_id = (
+                            partner.supplier_payment_mode_id.refund_payment_mode_id
+                        )
+
+    @api.onchange("partner_id")
+    def _onchange_partner_id(self):
+        """Force compute because the onchange chain doesn't call
+        ``_compute_partner_bank``.
+        """
+        res = super()._onchange_partner_id()
+        self._compute_partner_bank()
+        return res
 
     @api.depends("partner_id", "payment_mode_id")
     def _compute_partner_bank(self):
@@ -90,28 +113,12 @@ class AccountMove(models.Model):
                         bank_id = get_bank_id()
             move.partner_bank_id = bank_id
 
-    # I think copying payment mode from invoice to refund by default
-    # is a good idea because the most common way of "paying" a refund is to
-    # deduct it on the payment of the next invoice (and OCA/bank-payment
-    # allows to have negative payment lines since March 2016)
     def _reverse_move_vals(self, default_values, cancel=True):
         move_vals = super()._reverse_move_vals(default_values, cancel=cancel)
-        move_vals["payment_mode_id"] = self.payment_mode_id.id
+        move_vals["payment_mode_id"] = self.payment_mode_id.refund_payment_mode_id.id
         if self.move_type == "in_invoice":
             move_vals["partner_bank_id"] = self.partner_bank_id.id
         return move_vals
-
-    @api.constrains("company_id", "payment_mode_id")
-    def _check_payment_mode_company_constrains(self):
-        for rec in self.sudo():
-            if rec.payment_mode_id and rec.company_id != rec.payment_mode_id.company_id:
-                raise ValidationError(
-                    _(
-                        "The company of the invoice %s does not match "
-                        "with that of the payment mode"
-                    )
-                    % rec.name
-                )
 
     def partner_banks_to_show(self):
         self.ensure_one()
@@ -133,3 +140,14 @@ class AccountMove(models.Model):
             )
         # Return this as empty recordset
         return self.partner_bank_id
+
+    @api.model
+    def create(self, vals):
+        """Force compute partner_bank_id when invoice is created from SO
+        to avoid that odoo _prepare_invoice method value will be set.
+        """
+        if self.env.context.get("active_model") == "sale.order":  # pragma: no cover
+            virtual_move = self.new(vals)
+            virtual_move._compute_partner_bank()
+            vals["partner_bank_id"] = virtual_move.partner_bank_id.id
+        return super().create(vals)
